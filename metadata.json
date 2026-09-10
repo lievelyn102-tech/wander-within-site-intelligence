@@ -1,0 +1,6 @@
+{
+  "name": "Wander Within Site Intelligence",
+  "description": "Evidence-based diagnostic assistant for Blogger/Blogspot websites diagnosing indexing, technical HTML, canonicals, content, and AdSense readiness.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
