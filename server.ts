@@ -1,4 +1,7 @@
 import express, { Request, Response, NextFunction } from 'express';
+import cookieSession from 'cookie-session';
+import crypto from 'crypto';
+import { AsyncLocalStorage } from 'async_hooks';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import dotenv from 'dotenv';
@@ -20,7 +23,32 @@ const app = express();
 app.set('trust proxy', 1);
 const PORT = Number(process.env.PORT) || 3000;
 
+// Configure session middleware for isolated user authentication & tokens
+const isProduction = process.env.NODE_ENV === 'production';
+app.use(
+  cookieSession({
+    name: 'ww_session',
+    keys: [process.env.SESSION_SECRET || 'wander-within-secure-session-key-2026'],
+    maxAge: 30 * 24 * 60 * 60 * 1000, // 30 days
+    secure: isProduction, // Render reverse-proxy terminates TLS and sets X-Forwarded-Proto
+    sameSite: 'lax',
+    httpOnly: true,
+  })
+);
+
+// Request Context Storage for request-scoped isolation across async call stacks
+interface RequestContext {
+  req: Request;
+  res: Response;
+}
+const requestContext = new AsyncLocalStorage<RequestContext>();
+
+app.use((req: Request, res: Response, next: NextFunction) => {
+  requestContext.run({ req, res }, next);
+});
+
 app.use(express.json());
+
 
 // In-memory site store for multi-site Blogger/Blogspot architecture
 export interface RegisteredSite {
@@ -78,8 +106,8 @@ const userTenants: Map<string, UserTenantStore> = new Map();
 // In-memory rate-limiting timestamps
 const lastInspectTimestamps: Map<string, number> = new Map();
 
-// Server-side OAuth session state (tokens never exposed to the client)
-interface AuthSession {
+// Server-side OAuth session state (tokens stored in signed cookie-session, never exposed)
+export interface AuthSession {
   connected: boolean;
   accessToken: string | null;
   refreshToken: string | null;
@@ -94,46 +122,105 @@ interface AuthSession {
   error?: string | null;
 }
 
-const authSession: AuthSession = {
-  connected: false,
-  accessToken: null,
-  refreshToken: null,
-  expiresAt: null,
-  tokenType: null,
-  scope: null,
-  userId: null,
-  userEmail: null,
-  userName: null,
-  userPicture: null,
-  activeSiteId: null,
-  error: null,
-};
+function getCurrentRequest(): Request | undefined {
+  return requestContext.getStore()?.req;
+}
 
-// Resolve tenant identifier based on authenticated Google user ID or request header
+function getSessionAuth(req?: Request): AuthSession {
+  const currentReq = req || getCurrentRequest();
+  const session = (currentReq as any)?.session;
+  if (!session) {
+    return {
+      connected: false,
+      accessToken: null,
+      refreshToken: null,
+      expiresAt: null,
+      tokenType: null,
+      scope: null,
+      userId: null,
+      userEmail: null,
+      userName: null,
+      userPicture: null,
+      activeSiteId: null,
+      error: null,
+    };
+  }
+
+  return {
+    connected: Boolean(session.connected && session.accessToken),
+    accessToken: session.accessToken || null,
+    refreshToken: session.refreshToken || null,
+    expiresAt: session.expiresAt || null,
+    tokenType: session.tokenType || null,
+    scope: session.scope || null,
+    userId: session.userId || null,
+    userEmail: session.userEmail || null,
+    userName: session.userName || null,
+    userPicture: session.userPicture || null,
+    activeSiteId: session.activeSiteId || null,
+    error: session.error || null,
+  };
+}
+
+function updateSessionAuth(updates: Partial<AuthSession>, req?: Request): void {
+  const currentReq = req || getCurrentRequest();
+  if (!(currentReq as any)?.session) return;
+  const session = (currentReq as any).session;
+  for (const [key, val] of Object.entries(updates)) {
+    session[key] = val;
+  }
+}
+
+function clearSessionAuth(req?: Request): void {
+  const currentReq = req || getCurrentRequest();
+  if ((currentReq as any)?.session) {
+    (currentReq as any).session = null;
+  }
+}
+
+// Scoped OAuth2 Client factory - always creates a fresh instance per request
+function getScopedOAuth2Client(token: string) {
+  const oauth2Client = new google.auth.OAuth2();
+  oauth2Client.setCredentials({ access_token: token });
+  return oauth2Client;
+}
+
+// Resolve tenant identifier based on authenticated Google user ID or request session
 function getTenantId(req?: Request): string {
-  if (req) {
-    const customUserId = (req.headers['x-user-id'] as string) || (req.query?.userId as string);
+  const currentReq = req || getCurrentRequest();
+  if (currentReq) {
+    const customUserId = (currentReq.headers['x-user-id'] as string) || (currentReq.query?.userId as string);
     if (customUserId && typeof customUserId === 'string' && customUserId.trim()) {
       return customUserId.trim();
     }
-  }
-  if (authSession.connected && authSession.userId) {
-    return authSession.userId;
+    const session = (currentReq as any).session;
+    if (session) {
+      if (session.userId) {
+        return `user_${session.userId}`;
+      }
+      if (!session.anonymousId) {
+        session.anonymousId = crypto.randomUUID();
+      }
+      return `session_${session.anonymousId}`;
+    }
   }
   return 'default_session';
 }
 
 // Get or initialize the isolated tenant store for the current session
 function getTenantStore(req?: Request): UserTenantStore {
-  const tenantId = getTenantId(req);
+  const currentReq = req || getCurrentRequest();
+  const tenantId = getTenantId(currentReq);
+  const sessionAuth = getSessionAuth(currentReq);
+
   let store = userTenants.get(tenantId);
   if (!store) {
     store = {
       userId: tenantId,
-      userEmail: authSession.userId === tenantId ? authSession.userEmail : null,
-      userName: authSession.userId === tenantId ? authSession.userName : null,
-      userPicture: authSession.userId === tenantId ? authSession.userPicture : null,
-      activeSiteId: null,
+      userEmail: sessionAuth.userEmail || null,
+      userName: sessionAuth.userName || null,
+      userPicture: sessionAuth.userPicture || null,
+      activeSiteId: sessionAuth.activeSiteId || null,
       sites: [],
       inspections: new Map(),
       robotsSitemap: new Map(),
@@ -218,25 +305,7 @@ async function syncDiscoveredBloggerBlogs(
     store.activeSiteId = store.sites[0].id;
   }
   if (store.activeSiteId) {
-    authSession.activeSiteId = store.activeSiteId;
-  }
-
-  // Also mirror to default_session if tenant is an authenticated user session
-  if (store.userId !== 'default_session') {
-    const defStore = userTenants.get('default_session');
-    if (defStore) {
-      for (const site of store.sites) {
-        const idx = defStore.sites.findIndex((s) => s.id === site.id || s.url === site.url);
-        if (idx >= 0) {
-          defStore.sites[idx] = { ...site };
-        } else {
-          defStore.sites.push({ ...site });
-        }
-      }
-      if (!defStore.activeSiteId && defStore.sites.length > 0) {
-        defStore.activeSiteId = defStore.sites[0].id;
-      }
-    }
+    updateSessionAuth({ activeSiteId: store.activeSiteId }, req);
   }
 
   const activeSite = store.sites.find((s) => s.id === store.activeSiteId) || (store.sites[0] || null);
@@ -283,13 +352,17 @@ const siteAdSensePolicyReview = new Proxy(new Map<string, any>(), {
   },
 });
 
-// Helper: refresh token if expired
-async function getValidAccessToken(): Promise<string | null> {
-  if (!authSession.accessToken) return null;
+// Helper: refresh token if expired, strictly scoped to current request session
+async function getValidAccessToken(req?: Request): Promise<string | null> {
+  const currentReq = req || getCurrentRequest();
+  if (!currentReq) return null;
+
+  const session = (currentReq as any).session;
+  if (!session || !session.accessToken) return null;
 
   // Check if token is expired or within 60 seconds of expiration
-  if (authSession.expiresAt && Date.now() > authSession.expiresAt - 60000) {
-    if (authSession.refreshToken && process.env.GOOGLE_CLIENT_ID && process.env.GOOGLE_CLIENT_SECRET) {
+  if (session.expiresAt && Date.now() > session.expiresAt - 60000) {
+    if (session.refreshToken && process.env.GOOGLE_CLIENT_ID && process.env.GOOGLE_CLIENT_SECRET) {
       try {
         const refreshResp = await fetch('https://oauth2.googleapis.com/token', {
           method: 'POST',
@@ -297,23 +370,23 @@ async function getValidAccessToken(): Promise<string | null> {
           body: new URLSearchParams({
             client_id: process.env.GOOGLE_CLIENT_ID,
             client_secret: process.env.GOOGLE_CLIENT_SECRET,
-            refresh_token: authSession.refreshToken,
+            refresh_token: session.refreshToken,
             grant_type: 'refresh_token',
           }),
         });
 
         if (refreshResp.ok) {
           const data = await refreshResp.json();
-          authSession.accessToken = data.access_token;
-          authSession.expiresAt = Date.now() + (data.expires_in || 3600) * 1000;
-          if (data.scope) authSession.scope = data.scope;
-          authSession.error = null;
-          return authSession.accessToken;
+          session.accessToken = data.access_token;
+          session.expiresAt = Date.now() + (data.expires_in || 3600) * 1000;
+          if (data.scope) session.scope = data.scope;
+          session.error = null;
+          return session.accessToken;
         } else {
           const errText = await refreshResp.text();
-          console.error('Failed to refresh Google access token:', errText);
-          authSession.connected = false;
-          authSession.error = 'OAuth session expired. Please reconnect your Google account.';
+          console.error('Failed to refresh Google access token for session:', errText);
+          session.connected = false;
+          session.error = 'OAuth session expired. Please reconnect your Google account.';
           return null;
         }
       } catch (err) {
@@ -323,7 +396,7 @@ async function getValidAccessToken(): Promise<string | null> {
     }
   }
 
-  return authSession.accessToken;
+  return session.accessToken;
 }
 
 function getCallbackUrl(req?: Request): string {
@@ -428,6 +501,7 @@ function getGemini(options?: { forceUserKey?: boolean }): GoogleGenAI | null {
 // Health & System status
 app.get('/api/health', (req: Request, res: Response) => {
   const effectiveKey = getEffectiveGeminiApiKey();
+  const sessionAuth = getSessionAuth(req);
   res.json({
     status: 'ok',
     app: 'Wander Within Site Intelligence',
@@ -438,7 +512,7 @@ app.get('/api/health', (req: Request, res: Response) => {
     hasDefaultGeminiKey: Boolean(process.env.GEMINI_API_KEY?.trim()),
     hasUserGeminiKey: Boolean(process.env.USER_GEMINI_KEY?.trim()),
     hasGoogleOAuthConfigured: Boolean(process.env.GOOGLE_CLIENT_ID && process.env.GOOGLE_CLIENT_SECRET),
-    googleConnected: authSession.connected,
+    googleConnected: sessionAuth.connected,
     timestamp: new Date().toISOString(),
   });
 });
@@ -446,20 +520,21 @@ app.get('/api/health', (req: Request, res: Response) => {
 // OAuth connection status
 app.get('/api/auth/google/status', (req: Request, res: Response) => {
   const store = getTenantStore(req);
+  const sessionAuth = getSessionAuth(req);
   const hasCredentialsConfigured = Boolean(
     process.env.GOOGLE_CLIENT_ID && process.env.GOOGLE_CLIENT_SECRET
   );
 
   res.json({
-    connected: authSession.connected,
-    statusText: authSession.connected ? 'Connected' : 'Not connected',
+    connected: sessionAuth.connected,
+    statusText: sessionAuth.connected ? 'Connected' : 'Not connected',
     hasCredentialsConfigured,
-    userId: authSession.userId || store.userId || null,
-    userEmail: authSession.userEmail || store.userEmail || null,
-    userName: authSession.userName || store.userName || null,
-    userPicture: authSession.userPicture || store.userPicture || null,
+    userId: sessionAuth.userId || store.userId || null,
+    userEmail: sessionAuth.userEmail || store.userEmail || null,
+    userName: sessionAuth.userName || store.userName || null,
+    userPicture: sessionAuth.userPicture || store.userPicture || null,
     activeSiteId: store.activeSiteId || (store.sites[0]?.id || null),
-    error: authSession.error || null,
+    error: sessionAuth.error || null,
     readOnlyAccessEnforced: true,
     callbackUrl: getCallbackUrl(req),
     plannedScopes: [
@@ -604,61 +679,77 @@ app.get(['/auth/callback', '/auth/callback/'], async (req: Request, res: Respons
     }
 
     const tokenData = await tokenResponse.json();
-    authSession.connected = true;
-    authSession.accessToken = tokenData.access_token;
-    authSession.refreshToken = tokenData.refresh_token || authSession.refreshToken;
-    authSession.expiresAt = Date.now() + (tokenData.expires_in || 3600) * 1000;
-    authSession.tokenType = tokenData.token_type;
-    authSession.scope = tokenData.scope;
-    authSession.error = null;
+    const sessionAuth: AuthSession = {
+      connected: true,
+      accessToken: tokenData.access_token,
+      refreshToken: tokenData.refresh_token || null,
+      expiresAt: Date.now() + (tokenData.expires_in || 3600) * 1000,
+      tokenType: tokenData.token_type,
+      scope: tokenData.scope,
+      userId: null,
+      userEmail: null,
+      userName: null,
+      userPicture: null,
+      activeSiteId: null,
+      error: null,
+    };
 
     // Attempt to fetch authenticated user profile details
     try {
       const userinfoResp = await fetch('https://www.googleapis.com/oauth2/v2/userinfo', {
-        headers: { Authorization: `Bearer ${authSession.accessToken}` },
+        headers: { Authorization: `Bearer ${sessionAuth.accessToken}` },
       });
       if (userinfoResp.ok) {
         const userInfo = await userinfoResp.json();
-        authSession.userId = userInfo.id || userInfo.sub || null;
-        authSession.userEmail = userInfo.email || null;
-        authSession.userName = userInfo.name || null;
-        authSession.userPicture = userInfo.picture || null;
-
-        if (authSession.userId) {
-          const userStore = getTenantStore();
-          userStore.userId = authSession.userId;
-          userStore.userEmail = authSession.userEmail;
-          userStore.userName = authSession.userName;
-          userStore.userPicture = authSession.userPicture;
-
-          // Migrate any sites from 'default_session' to the user store if needed
-          const defaultStore = userTenants.get('default_session');
-          if (defaultStore && defaultStore.sites.length > 0) {
-            for (const s of defaultStore.sites) {
-              if (!userStore.sites.some((existing) => existing.id === s.id || existing.url === s.url)) {
-                userStore.sites.push(s);
-              }
-            }
-          }
-
-          // Auto-sync user's Blogger blogs right upon OAuth connection
-          try {
-            const blogResp = await fetch('https://www.googleapis.com/blogger/v3/users/self/blogs', {
-              headers: { Authorization: `Bearer ${authSession.accessToken}` },
-            });
-            if (blogResp.ok) {
-              const blogData = await blogResp.json();
-              if (blogData.items && blogData.items.length > 0) {
-                await syncDiscoveredBloggerBlogs(blogData.items, undefined, userStore);
-              }
-            }
-          } catch (blogErr) {
-            console.warn('Could not auto-sync blogs on oauth callback:', blogErr);
-          }
-        }
+        sessionAuth.userId = userInfo.id || userInfo.sub || null;
+        sessionAuth.userEmail = userInfo.email || null;
+        sessionAuth.userName = userInfo.name || null;
+        sessionAuth.userPicture = userInfo.picture || null;
       }
     } catch (userErr) {
       console.warn('Could not fetch user profile details:', userErr);
+    }
+
+    // Persist credentials strictly to this visitor's session
+    updateSessionAuth(sessionAuth, req);
+
+    if (sessionAuth.userId) {
+      const userStore = getTenantStore(req);
+      userStore.userId = `user_${sessionAuth.userId}`;
+      userStore.userEmail = sessionAuth.userEmail;
+      userStore.userName = sessionAuth.userName;
+      userStore.userPicture = sessionAuth.userPicture;
+
+      // Migrate any sites from this visitor's anonymous session if they added sites prior to logging in
+      const anonId = (req as any).session?.anonymousId;
+      if (anonId) {
+        const anonStore = userTenants.get(`session_${anonId}`);
+        if (anonStore && anonStore.sites.length > 0) {
+          for (const s of anonStore.sites) {
+            if (!userStore.sites.some((existing) => existing.id === s.id || existing.url === s.url)) {
+              userStore.sites.push(s);
+            }
+          }
+          if (!userStore.activeSiteId && anonStore.activeSiteId) {
+            userStore.activeSiteId = anonStore.activeSiteId;
+          }
+        }
+      }
+
+      // Auto-sync user's Blogger blogs right upon OAuth connection
+      try {
+        const blogResp = await fetch('https://www.googleapis.com/blogger/v3/users/self/blogs', {
+          headers: { Authorization: `Bearer ${sessionAuth.accessToken}` },
+        });
+        if (blogResp.ok) {
+          const blogData = await blogResp.json();
+          if (blogData.items && blogData.items.length > 0) {
+            await syncDiscoveredBloggerBlogs(blogData.items, req, userStore);
+          }
+        }
+      } catch (blogErr) {
+        console.warn('Could not auto-sync blogs on oauth callback:', blogErr);
+      }
     }
 
     // Success response: closes popup and notifies opener
@@ -696,15 +787,7 @@ app.get(['/auth/callback', '/auth/callback/'], async (req: Request, res: Respons
 // Disconnect Google Account
 app.post('/api/auth/google/disconnect', (req: Request, res: Response) => {
   const store = getTenantStore(req);
-  authSession.connected = false;
-  authSession.accessToken = null;
-  authSession.refreshToken = null;
-  authSession.expiresAt = null;
-  authSession.userId = null;
-  authSession.userEmail = null;
-  authSession.userName = null;
-  authSession.userPicture = null;
-  authSession.error = null;
+  clearSessionAuth(req);
 
   // Mark all sites as blogger and search-console disconnected
   store.sites.forEach((site) => {
@@ -728,9 +811,10 @@ app.post('/api/auth/google/disconnect', (req: Request, res: Response) => {
 // Check Blogger connection & scope status
 app.get('/api/blogger/status', async (req: Request, res: Response) => {
   try {
-    const token = await getValidAccessToken();
-    const connected = Boolean(authSession.connected && token);
-    const scopeStr = authSession.scope || '';
+    const token = await getValidAccessToken(req);
+    const sessionAuth = getSessionAuth(req);
+    const connected = Boolean(sessionAuth.connected && token);
+    const scopeStr = sessionAuth.scope || '';
     const hasBloggerScope = connected && (
       scopeStr.includes('https://www.googleapis.com/auth/blogger.readonly') ||
       scopeStr.includes('https://www.googleapis.com/auth/blogger') ||
@@ -740,8 +824,8 @@ app.get('/api/blogger/status', async (req: Request, res: Response) => {
     res.json({
       connected,
       hasBloggerScope,
-      userEmail: authSession.userEmail || null,
-      userName: authSession.userName || null,
+      userEmail: sessionAuth.userEmail || null,
+      userName: sessionAuth.userName || null,
     });
   } catch (err: any) {
     res.status(500).json({
@@ -755,7 +839,7 @@ app.get('/api/blogger/status', async (req: Request, res: Response) => {
 // List user's accessible Blogger blogs
 app.get('/api/blogger/blogs', async (req: Request, res: Response) => {
   try {
-    const token = await getValidAccessToken();
+    const token = await getValidAccessToken(req);
     if (!token) {
       res.status(401).json({
         error: 'Unauthenticated',
@@ -764,9 +848,7 @@ app.get('/api/blogger/blogs', async (req: Request, res: Response) => {
       return;
     }
 
-    const oauth2Client = new google.auth.OAuth2();
-    oauth2Client.setCredentials({ access_token: token });
-
+    const oauth2Client = getScopedOAuth2Client(token);
     const blogger = google.blogger({ version: 'v3', auth: oauth2Client });
     const response = await blogger.blogs.listByUser({ userId: 'self' });
     const rawBlogs = response.data?.items || [];
@@ -790,7 +872,7 @@ app.get('/api/blogger/blogs', async (req: Request, res: Response) => {
       status: 'LIVE',
     }));
 
-    // Synchronize discovered blogs into tenant store and global state
+    // Synchronize discovered blogs into tenant store and user session
     const store = getTenantStore(req);
     const { sites, activeSite } = await syncDiscoveredBloggerBlogs(rawBlogs, req, store);
 
@@ -806,8 +888,7 @@ app.get('/api/blogger/blogs', async (req: Request, res: Response) => {
     console.error('Error in /api/blogger/blogs:', err);
     const status = err?.code || err?.status || (err?.message?.includes('401') ? 401 : 500);
     if (status === 401 || err?.message?.includes('invalid_grant') || err?.message?.includes('Unauthenticated')) {
-      authSession.connected = false;
-      authSession.error = 'Session expired. Please reconnect.';
+      updateSessionAuth({ connected: false, error: 'Session expired. Please reconnect.' }, req);
       res.status(401).json({ error: 'Unauthenticated', connected: false });
       return;
     }
@@ -1035,8 +1116,7 @@ app.get('/api/gsc/sites', async (req: Request, res: Response) => {
       const errText = await resp.text();
       console.error('GSC sites list error:', resp.status, errText);
       if (resp.status === 401) {
-        authSession.connected = false;
-        authSession.error = 'Session expired. Please reconnect.';
+        updateSessionAuth({ connected: false, error: 'Session expired. Please reconnect.' }, req);
         res.status(401).json({ error: 'Session expired. Please reconnect.', connected: false });
         return;
       }
@@ -1211,9 +1291,7 @@ app.post('/api/gsc/inspect-url', async (req: Request, res: Response) => {
   }
 
   try {
-    const oauth2Client = new google.auth.OAuth2();
-    oauth2Client.setCredentials({ access_token: token });
-
+    const oauth2Client = getScopedOAuth2Client(token);
     const searchconsole = google.searchconsole({ version: 'v1', auth: oauth2Client });
     const response = await searchconsole.urlInspection.index.inspect({
       requestBody: {
@@ -1592,10 +1670,11 @@ app.get(['/api/gsc/coverage-summary', '/api/gsc/coverage-summary/:siteUrl(*)'], 
 // Multi-site & Session Management Endpoints
 app.get('/api/sites', async (req: Request, res: Response) => {
   const store = getTenantStore(req);
+  const sessionAuth = getSessionAuth(req);
 
   // If connected to Google and store.sites is empty, auto-sync from Blogger API
-  if (authSession.connected && store.sites.length === 0) {
-    const token = await getValidAccessToken();
+  if (sessionAuth.connected && store.sites.length === 0) {
+    const token = await getValidAccessToken(req);
     if (token) {
       try {
         const resp = await fetch('https://www.googleapis.com/blogger/v3/users/self/blogs', {
@@ -1613,20 +1692,9 @@ app.get('/api/sites', async (req: Request, res: Response) => {
     }
   }
 
-  // If still empty in userStore, check default_session
-  if (store.sites.length === 0 && store.userId !== 'default_session') {
-    const defStore = userTenants.get('default_session');
-    if (defStore && defStore.sites.length > 0) {
-      for (const s of defStore.sites) {
-        store.sites.push({ ...s });
-      }
-      if (defStore.activeSiteId) store.activeSiteId = defStore.activeSiteId;
-    }
-  }
-
   if (!store.activeSiteId && store.sites.length > 0) {
     store.activeSiteId = store.sites[0].id;
-    authSession.activeSiteId = store.sites[0].id;
+    updateSessionAuth({ activeSiteId: store.sites[0].id }, req);
   }
 
   const activeSite = store.sites.find((s) => s.id === store.activeSiteId) || (store.sites[0] || null);
@@ -1638,9 +1706,9 @@ app.get('/api/sites', async (req: Request, res: Response) => {
     activeSite,
     user: {
       id: store.userId,
-      email: store.userEmail || authSession.userEmail || null,
-      name: store.userName || authSession.userName || null,
-      picture: store.userPicture || authSession.userPicture || null,
+      email: store.userEmail || sessionAuth.userEmail || null,
+      name: store.userName || sessionAuth.userName || null,
+      picture: store.userPicture || sessionAuth.userPicture || null,
     },
   });
 });
@@ -1654,15 +1722,7 @@ app.post('/api/sites/active', (req: Request, res: Response) => {
   }
 
   const store = getTenantStore(req);
-  let site = store.sites.find((s) => s.id === siteId);
-  if (!site) {
-    const defStore = userTenants.get('default_session');
-    const fromDef = defStore?.sites.find((s) => s.id === siteId);
-    if (fromDef) {
-      store.sites.push({ ...fromDef });
-      site = fromDef;
-    }
-  }
+  const site = store.sites.find((s) => s.id === siteId);
 
   if (!site) {
     res.status(404).json({ error: 'Site not found in current user session.' });
@@ -1670,12 +1730,7 @@ app.post('/api/sites/active', (req: Request, res: Response) => {
   }
 
   store.activeSiteId = site.id;
-  authSession.activeSiteId = site.id;
-
-  const defStore = userTenants.get('default_session');
-  if (defStore) {
-    defStore.activeSiteId = site.id;
-  }
+  updateSessionAuth({ activeSiteId: site.id }, req);
 
   res.json({
     success: true,
@@ -1696,6 +1751,7 @@ app.post('/api/sites', (req: Request, res: Response) => {
   const cleanUrl = url.trim().replace(/^https?:\/\//i, '').replace(/\/+$/, '');
   const isBlogspot = cleanUrl.toLowerCase().includes('.blogspot.');
   const store = getTenantStore(req);
+  const sessionAuth = getSessionAuth(req);
 
   const newSite: RegisteredSite = {
     id: `site_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`,
@@ -1705,7 +1761,7 @@ app.post('/api/sites', (req: Request, res: Response) => {
     platform: isBlogspot ? 'blogger_subdomain' : 'blogger_custom_domain',
     createdAt: new Date().toISOString(),
     connections: {
-      blogger: Boolean(bloggerBlogId && authSession.connected),
+      blogger: Boolean(bloggerBlogId && sessionAuth.connected),
       searchConsole: false,
       adsense: false,
       crawler: true,
@@ -1721,7 +1777,7 @@ app.post('/api/sites', (req: Request, res: Response) => {
 
   store.sites.push(newSite);
   store.activeSiteId = newSite.id;
-  authSession.activeSiteId = newSite.id;
+  updateSessionAuth({ activeSiteId: newSite.id }, req);
 
   res.status(201).json({ site: newSite, message: 'Site registered successfully.' });
 });
@@ -1747,7 +1803,7 @@ app.delete(['/api/sites/:siteId', '/api/sites/:id'], (req: Request, res: Respons
 
   if (store.activeSiteId === siteId) {
     store.activeSiteId = store.sites.length > 0 ? store.sites[0].id : null;
-    authSession.activeSiteId = store.activeSiteId;
+    updateSessionAuth({ activeSiteId: store.activeSiteId }, req);
   }
 
   res.json({
@@ -1760,11 +1816,12 @@ app.delete(['/api/sites/:siteId', '/api/sites/:id'], (req: Request, res: Respons
 // Cleanly flush active session data, cached audits, and tokens
 app.post('/api/session/clear', async (req: Request, res: Response) => {
   const store = getTenantStore(req);
+  const sessionAuth = getSessionAuth(req);
 
   // Revoke token if active
-  if (authSession.accessToken) {
+  if (sessionAuth.accessToken) {
     try {
-      await fetch(`https://oauth2.googleapis.com/revoke?token=${encodeURIComponent(authSession.accessToken)}`, {
+      await fetch(`https://oauth2.googleapis.com/revoke?token=${encodeURIComponent(sessionAuth.accessToken)}`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
       });
@@ -1782,18 +1839,7 @@ app.post('/api/session/clear', async (req: Request, res: Response) => {
   store.activeSiteId = null;
 
   // Reset OAuth session credentials
-  authSession.connected = false;
-  authSession.accessToken = null;
-  authSession.refreshToken = null;
-  authSession.expiresAt = null;
-  authSession.tokenType = null;
-  authSession.scope = null;
-  authSession.userId = null;
-  authSession.userEmail = null;
-  authSession.userName = null;
-  authSession.userPicture = null;
-  authSession.activeSiteId = null;
-  authSession.error = null;
+  clearSessionAuth(req);
 
   res.json({
     success: true,
@@ -1804,18 +1850,19 @@ app.post('/api/session/clear', async (req: Request, res: Response) => {
 // Session overview and cache statistics endpoint
 app.get('/api/session/info', (req: Request, res: Response) => {
   const store = getTenantStore(req);
+  const sessionAuth = getSessionAuth(req);
   res.json({
     userId: store.userId,
-    userEmail: store.userEmail || authSession.userEmail || null,
-    userName: store.userName || authSession.userName || null,
-    userPicture: store.userPicture || authSession.userPicture || null,
-    connected: authSession.connected,
+    userEmail: store.userEmail || sessionAuth.userEmail || null,
+    userName: store.userName || sessionAuth.userName || null,
+    userPicture: store.userPicture || sessionAuth.userPicture || null,
+    connected: sessionAuth.connected,
     activeSiteId: store.activeSiteId || (store.sites.length > 0 ? store.sites[0].id : null),
     sitesCount: store.sites.length,
     scopes: {
-      blogger: Boolean(authSession.scope?.includes('blogger.readonly') || authSession.connected),
-      searchConsole: Boolean(authSession.scope?.includes('webmasters.readonly') || authSession.connected),
-      adsense: Boolean(authSession.scope?.includes('adsense.readonly') || authSession.connected),
+      blogger: Boolean(sessionAuth.scope?.includes('blogger.readonly') || sessionAuth.connected),
+      searchConsole: Boolean(sessionAuth.scope?.includes('webmasters.readonly') || sessionAuth.connected),
+      adsense: Boolean(sessionAuth.scope?.includes('adsense.readonly') || sessionAuth.connected),
     },
     cacheStats: {
       inspectionsCount: Array.from(store.inspections.values()).reduce((sum, list) => sum + list.length, 0),
@@ -4267,7 +4314,8 @@ app.get('/api/adsense/ai-policy-review/latest', (req: Request, res: Response) =>
 
 // 5. Optional AdSense Management API: query account status if user connected Google Account with adsense scope
 app.get('/api/adsense/account-status', async (req: Request, res: Response) => {
-  if (!authSession.connected || !authSession.accessToken) {
+  const sessionAuth = getSessionAuth(req);
+  if (!sessionAuth.connected || !sessionAuth.accessToken) {
     res.json({
       connected: false,
       message: 'Google Account not connected or AdSense scope not granted.',
@@ -4277,7 +4325,7 @@ app.get('/api/adsense/account-status', async (req: Request, res: Response) => {
   }
 
   try {
-    const token = await getValidAccessToken();
+    const token = await getValidAccessToken(req);
     if (!token) {
       res.json({ connected: false, message: 'OAuth token refresh failed.', accounts: [] });
       return;
