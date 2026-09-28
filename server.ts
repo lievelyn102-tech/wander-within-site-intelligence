@@ -8,6 +8,8 @@ import dotenv from 'dotenv';
 import { GoogleGenAI, Type } from '@google/genai';
 import { google } from 'googleapis';
 import * as cheerio from 'cheerio';
+import helmet from 'helmet';
+import rateLimit from 'express-rate-limit';
 
 dotenv.config();
 
@@ -21,14 +23,42 @@ const _dirname =
 
 const app = express();
 app.set('trust proxy', 1);
+app.disable('x-powered-by');
+app.use(helmet({
+  contentSecurityPolicy: false, // keep false for React Vite
+  crossOriginEmbedderPolicy: false,
+  crossOriginOpenerPolicy: false
+}));
+
+// Rate limiting for inspection endpoints (protect GSC quota 2000/day)
+const inspectLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000, // 15 minutes
+  max: 30, // 30 requests per 15 min per IP
+  message: { error: 'Too many inspection requests, please try again after 15 minutes. GSC quota protection.' },
+  standardHeaders: true,
+  legacyHeaders: false,
+  keyGenerator: (req) => {
+    return getTenantId(req as any) || req.ip || 'unknown';
+  }
+});
+
 const PORT = Number(process.env.PORT) || 3000;
 
 // Configure session middleware for isolated user authentication & tokens
 const isProduction = process.env.NODE_ENV === 'production';
+
+// Enforce SESSION_SECRET in production
+if (isProduction && !process.env.SESSION_SECRET) {
+  console.error('FATAL: SESSION_SECRET must be set in production environment');
+  // Don't crash on Render free tier, but warn loudly - generate secure random if missing
+  process.env.SESSION_SECRET = crypto.randomBytes(32).toString('hex');
+  console.warn('Generated temporary SESSION_SECRET - set a persistent one in Render env vars');
+}
+
 app.use(
   cookieSession({
     name: 'ww_session',
-    keys: [process.env.SESSION_SECRET || 'wander-within-secure-session-key-2026'],
+    keys: [process.env.SESSION_SECRET || crypto.randomBytes(32).toString('hex')],
     maxAge: 30 * 24 * 60 * 60 * 1000, // 30 days
     secure: isProduction, // Render reverse-proxy terminates TLS and sets X-Forwarded-Proto
     sameSite: 'lax',
@@ -105,6 +135,35 @@ const userTenants: Map<string, UserTenantStore> = new Map();
 
 // In-memory rate-limiting timestamps
 const lastInspectTimestamps: Map<string, number> = new Map();
+
+// SSRF Protection - block private IPs and metadata endpoints
+function isPrivateHost(hostname: string): boolean {
+  const lower = hostname.toLowerCase();
+  if (lower === 'localhost' || lower === '127.0.0.1' || lower === '::1' || lower === '0.0.0.0') return true;
+  if (lower.startsWith('10.') || lower.startsWith('192.168.')) return true;
+  if (lower.startsWith('172.')) {
+    const second = parseInt(lower.split('.')[1] || '0', 10);
+    if (second >= 16 && second <= 31) return true;
+  }
+  if (lower === '169.254.169.254' || lower.includes('metadata.google.internal') || lower.includes('metadata.google')) return true;
+  if (lower.endsWith('.internal') || lower.endsWith('.local')) return true;
+  return false;
+}
+
+function isAllowedTargetUrl(urlString: string): boolean {
+  try {
+    const u = new URL(urlString);
+    if (u.protocol !== 'https:' && u.protocol !== 'http:') return false;
+    if (isPrivateHost(u.hostname)) return false;
+    if (u.hostname.includes('169.254.169.254')) return false;
+    // Optional: restrict to Blogger only if you want - uncomment next 2 lines
+    // const isBlogspot = u.hostname.toLowerCase().includes('.blogspot.');
+    // if (!isBlogspot && !u.hostname.includes('.')) return false;
+    return true;
+  } catch {
+    return false;
+  }
+}
 
 // Server-side OAuth session state (tokens stored in signed cookie-session, never exposed)
 export interface AuthSession {
@@ -189,10 +248,6 @@ function getScopedOAuth2Client(token: string) {
 function getTenantId(req?: Request): string {
   const currentReq = req || getCurrentRequest();
   if (currentReq) {
-    const customUserId = (currentReq.headers['x-user-id'] as string) || (currentReq.query?.userId as string);
-    if (customUserId && typeof customUserId === 'string' && customUserId.trim()) {
-      return customUserId.trim();
-    }
     const session = (currentReq as any).session;
     if (session) {
       if (session.userId) {
@@ -1221,7 +1276,7 @@ app.all(['/api/gsc/match-property'], async (req: Request, res: Response) => {
 });
 
 // 2.5 Google Search Console URL Inspection API
-app.post('/api/gsc/inspect-url', async (req: Request, res: Response) => {
+app.post('/api/gsc/inspect-url', inspectLimiter, async (req: Request, res: Response) => {
   const token = await getValidAccessToken();
   if (!token) {
     res.status(401).json({
@@ -1893,6 +1948,19 @@ async function performUrlInspection(targetUrl: string, siteId?: string): Promise
 
   const targetHost = targetParsed.hostname.toLowerCase();
 
+  // Input validation
+  if (targetParsed.toString().length > 2048) {
+    throw new Error('URL too long - maximum 2048 characters');
+  }
+  if (targetParsed.protocol !== 'https:' && targetParsed.protocol !== 'http:') {
+    throw new Error('Only http and https protocols are allowed');
+  }
+
+  // SSRF protection - validate target URL
+  if (!isAllowedTargetUrl(targetParsed.toString())) {
+    throw new Error(`Target URL ${targetHost} is not allowed - private IPs and metadata endpoints are blocked for security.`);
+  }
+
   // Validate against registered sites if user has registered sites
   let matchedSite: RegisteredSite | undefined;
   if (siteId) {
@@ -1955,6 +2023,11 @@ async function performUrlInspection(targetUrl: string, siteId?: string): Promise
       if (loc) {
         try {
           const nextUrl = new URL(loc, currentUrl).toString();
+          // SSRF check for redirect target
+          if (!isAllowedTargetUrl(nextUrl)) {
+            console.warn(`Blocked redirect to private host: ${nextUrl}`);
+            break;
+          }
           redirectChain.push(nextUrl);
           currentUrl = nextUrl;
           hops++;
@@ -2610,7 +2683,33 @@ async function performUrlInspection(targetUrl: string, siteId?: string): Promise
 }
 
 // 1. URL Inspector Endpoint
-app.all('/api/inspect/url', async (req: Request, res: Response) => {
+app.post('/api/inspect/url', inspectLimiter, async (req: Request, res: Response) => {
+  const targetUrl = (req.body?.url || req.query?.url) as string;
+  const siteId = (req.body?.siteId || req.query?.siteId) as string | undefined;
+
+  if (!targetUrl || typeof targetUrl !== 'string') {
+    res.status(400).json({ error: 'target URL is required.' });
+    return;
+  }
+
+  try {
+    const { inspection, matchedSite } = await performUrlInspection(targetUrl, siteId);
+    res.json({
+      success: true,
+      inspection,
+      siteUpdated: Boolean(matchedSite),
+      activeSiteId: matchedSite?.id || null,
+    });
+  } catch (err: any) {
+    console.error('URL inspection error:', err);
+    res.status(400).json({
+      error: err?.message || 'Failed to inspect URL.',
+    });
+  }
+});
+
+// Also support GET for backwards-compatibility or query testing
+app.get('/api/inspect/url', inspectLimiter, async (req: Request, res: Response) => {
   const targetUrl = (req.body?.url || req.query?.url) as string;
   const siteId = (req.body?.siteId || req.query?.siteId) as string | undefined;
 
@@ -2636,7 +2735,7 @@ app.all('/api/inspect/url', async (req: Request, res: Response) => {
 });
 
 // 2. Robots.txt and Sitemap.xml Inspector Endpoint
-app.get('/api/inspect/sitemap-and-robots', async (req: Request, res: Response) => {
+app.get('/api/inspect/sitemap-and-robots', inspectLimiter, async (req: Request, res: Response) => {
   const rawSiteUrl = req.query.siteUrl as string;
   const siteId = req.query.siteId as string | undefined;
   const forceRefresh = req.query.forceRefresh === 'true' || req.query.refresh === 'true';
@@ -2944,7 +3043,7 @@ app.get('/api/diagnostics/architecture', (req: Request, res: Response) => {
 
 // AI Diagnostic Reasoning Layer (server-side Gemini invocation with structured evidence reasoning)
 app.post('/api/ai/diagnose', async (req: Request, res: Response) => {
-  const {
+  let {
     site,
     technicalAudit,
     robotsSitemap,
@@ -2958,6 +3057,15 @@ app.post('/api/ai/diagnose', async (req: Request, res: Response) => {
     targetUrl: explicitTargetUrl,
     targetTitle: explicitTargetTitle,
   } = req.body;
+
+  // Sanitize customNotes to prevent prompt injection
+  if (customNotes && typeof customNotes === 'string') {
+    if (customNotes.length > 1000) {
+      customNotes = customNotes.substring(0, 1000) + '... [truncated]';
+    }
+    // Remove potential prompt injection patterns
+    customNotes = customNotes.replace(/ignore previous instructions/gi, '[filtered]');
+  }
 
   const targetSiteId = siteId || site?.id || (userSites.length > 0 ? userSites[0].id : 'default');
 
@@ -4380,6 +4488,25 @@ async function startServer() {
     res.redirect(301, '/terms');
   });
 
+  // FIX: Own robots.txt and sitemap.xml for audit.wanderinlife.com (must be BEFORE static and SPA fallback)
+  app.get('/robots.txt', (req: Request, res: Response) => {
+    res.type('text/plain');
+    res.send(`User-agent: *
+Allow: /
+Sitemap: https://audit.wanderinlife.com/sitemap.xml
+`);
+  });
+
+  app.get('/sitemap.xml', (req: Request, res: Response) => {
+    res.type('application/xml');
+    res.send(`<?xml version="1.0" encoding="UTF-8"?>
+<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
+  <url><loc>https://audit.wanderinlife.com/</loc><priority>1.0</priority></url>
+  <url><loc>https://audit.wanderinlife.com/privacy</loc><priority>0.5</priority></url>
+  <url><loc>https://audit.wanderinlife.com/terms</loc><priority>0.5</priority></url>
+</urlset>`);
+  });
+
   if (process.env.NODE_ENV !== 'production') {
     const { createServer: createViteServer } = await import('vite');
     const vite = await createViteServer({
@@ -4392,6 +4519,26 @@ async function startServer() {
       typeof _dirname !== 'undefined' && path.basename(_dirname) === 'dist'
         ? _dirname
         : path.join(process.cwd(), 'dist');
+
+    // Also ensure production static fallback has own robots.txt and sitemap.xml before express.static
+    app.get('/robots.txt', (req: Request, res: Response) => {
+      res.type('text/plain');
+      res.send(`User-agent: *
+Allow: /
+Sitemap: https://audit.wanderinlife.com/sitemap.xml
+`);
+    });
+
+    app.get('/sitemap.xml', (req: Request, res: Response) => {
+      res.type('application/xml');
+      res.send(`<?xml version="1.0" encoding="UTF-8"?>
+<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
+  <url><loc>https://audit.wanderinlife.com/</loc><priority>1.0</priority></url>
+  <url><loc>https://audit.wanderinlife.com/privacy</loc><priority>0.5</priority></url>
+  <url><loc>https://audit.wanderinlife.com/terms</loc><priority>0.5</priority></url>
+</urlset>`);
+    });
+
     app.use(express.static(distPath));
 
     // Explicit backend routes before the catch-all SPA fallback:
